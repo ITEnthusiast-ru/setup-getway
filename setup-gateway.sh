@@ -9,7 +9,7 @@ echo "=========================================="
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 # Функция для логирования
 log() {
@@ -27,7 +27,7 @@ error() {
 
 # Проверка прав root
 check_root() {
-    if [[ $EUID -ne 0 ]]; then
+    if [ "$EUID" -ne 0 ]; then
         error "Этот скрипт должен запускаться с правами root"
     fi
 }
@@ -43,7 +43,7 @@ setup_variables() {
     EMAIL=${EMAIL:-admin@$DOMAIN}
     
     read -p "Введите OpenAI API Key: " OPENAI_API_KEY
-    if [[ -z "$OPENAI_API_KEY" ]]; then
+    if [ -z "$OPENAI_API_KEY" ]; then
         error "OpenAI API Key обязателен для работы"
     fi
     
@@ -52,15 +52,19 @@ setup_variables() {
     
     read -s -p "Введите пароль для базовой аутентификации: " PASSWORD
     echo
-    if [[ -z "$PASSWORD" ]]; then
+    if [ -z "$PASSWORD" ]; then
         error "Пароль не может быть пустым"
     fi
     
     # Генерация хеша пароля для basic auth
-    BASIC_AUTH_HASH=$(echo $(htpasswd -nb $USERNAME $PASSWORD) | sed -e s/\\$/\\$\\$/g)
+    if ! command -v htpasswd &> /dev/null; then
+        apt-get update
+        apt-get install -y apache2-utils
+    fi
+    BASIC_AUTH_HASH=$(htpasswd -nb "$USERNAME" "$PASSWORD" | sed -e 's/\$/\$\$/g')
     
     # Генерация случайного API ключа для n8n
-    N8N_API_KEY=$(openssl rand -hex 32)
+    N8N_API_KEY=$(openssl rand -hex 32 2>/dev/null || echo "fallback-key-$(date +%s)")
     
     log "Параметры успешно настроены"
 }
@@ -91,7 +95,7 @@ install_dependencies() {
     # Установка Docker Compose
     if ! command -v docker-compose &> /dev/null; then
         log "Установка Docker Compose..."
-        curl -L "https://github.com/docker/compose/releases/download/v2.20.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+        curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
         chmod +x /usr/local/bin/docker-compose
     fi
     
@@ -104,7 +108,9 @@ install_dependencies() {
 create_directory_structure() {
     log "Создание структуры директорий..."
     
-    mkdir -p /opt/api-gateway/{traefik/dynamic,services/openai-proxy,logs}
+    mkdir -p /opt/api-gateway/traefik/dynamic
+    mkdir -p /opt/api-gateway/services/openai-proxy
+    mkdir -p /opt/api-gateway/logs
     cd /opt/api-gateway
 }
 
@@ -127,7 +133,7 @@ BASIC_AUTH=$BASIC_AUTH_HASH
 EOF
 
     # Основной конфиг Traefik
-    cat > /opt/api-gateway/traefik/traefik.yml << 'EOF'
+    cat > /opt/api-gateway/traefik/traefik.yml << EOF
 api:
   dashboard: true
   debug: false
@@ -154,37 +160,33 @@ providers:
 certificatesResolvers:
   letsencrypt:
     acme:
-      email: "${EMAIL}"
+      email: "$EMAIL"
       storage: "/etc/traefik/acme.json"
       httpChallenge:
         entryPoint: web
 EOF
 
     # Динамическая конфигурация
-    cat > /opt/api-gateway/traefik/dynamic/middlewares.yml << 'EOF'
+    cat > /opt/api-gateway/traefik/dynamic/middlewares.yml << EOF
 http:
   middlewares:
-    # Базовая аутентификация
     auth-middleware:
       basicAuth:
         users:
-          - "${BASIC_AUTH}"
+          - "$BASIC_AUTH_HASH"
     
-    # Лимит запросов
     rate-limit-middleware:
       rateLimit:
         burst: 100
         period: 1m
     
-    # Добавление заголовков для OpenAI
     openai-headers:
       headers:
         customRequestHeaders:
-          Authorization: "Bearer ${OPENAI_API_KEY}"
+          Authorization: "Bearer $OPENAI_API_KEY"
         customResponseHeaders:
           X-Gateway: "traefik-proxy"
     
-    # Безопасные заголовки
     security-headers:
       headers:
         frameDeny: true
@@ -197,11 +199,10 @@ http:
         stsSeconds: 31536000
 
   routers:
-    # OpenAI API
     openai-router:
       entryPoints:
         - websecure
-      rule: "Host(`${DOMAIN}`) && PathPrefix(`/openai/`)"
+      rule: "Host(\`$DOMAIN\`) && PathPrefix(\`/openai/\`)"
       service: openai-service
       middlewares:
         - auth-middleware
@@ -211,11 +212,10 @@ http:
       tls:
         certResolver: letsencrypt
     
-    # Dashboard Traefik
     traefik-dashboard:
       entryPoints:
         - websecure
-      rule: "Host(`${DOMAIN}`) && (PathPrefix(`/api`) || PathPrefix(`/dashboard`))"
+      rule: "Host(\`$DOMAIN\`) && (PathPrefix(\`/api\`) || PathPrefix(\`/dashboard\`))"
       service: api@internal
       middlewares:
         - auth-middleware
@@ -231,7 +231,7 @@ http:
 EOF
 
     # Docker Compose
-    cat > /opt/api-gateway/docker-compose.yml << 'EOF'
+    cat > /opt/api-gateway/docker-compose.yml << EOF
 version: '3.8'
 
 services:
@@ -254,10 +254,7 @@ services:
       - ./traefik/acme.json:/etc/traefik/acme.json
       - ./logs:/var/log/traefik
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - DOMAIN=${DOMAIN}
-      - EMAIL=${EMAIL}
-      - BASIC_AUTH=${BASIC_AUTH}
+      - OPENAI_API_KEY=$OPENAI_API_KEY
     labels:
       - "traefik.enable=true"
     logging:
@@ -269,90 +266,6 @@ services:
 networks:
   proxy:
     name: proxy
-EOF
-
-    # Дополнительный кастомный прокси (опционально)
-    cat > /opt/api-gateway/services/openai-proxy/docker-compose.yml << 'EOF'
-version: '3.8'
-
-services:
-  openai-proxy:
-    image: node:18-alpine
-    container_name: openai-proxy
-    restart: unless-stopped
-    working_dir: /app
-    volumes:
-      - ./:/app
-    networks:
-      - proxy
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.openai-custom.rule=Host(`${DOMAIN}`) && PathPrefix(`/v1/`)"
-      - "traefik.http.routers.openai-custom.tls=true"
-      - "traefik.http.routers.openai-custom.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.openai-custom.middlewares=auth-middleware@file"
-      - "traefik.http.services.openai-custom.loadbalancer.server.port=3000"
-    environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-    
-networks:
-  proxy:
-    external: true
-    name: proxy
-EOF
-
-    # Простой Node.js прокси
-    cat > /opt/api-gateway/services/openai-proxy/package.json << 'EOF'
-{
-  "name": "openai-proxy",
-  "version": "1.0.0",
-  "description": "Custom OpenAI proxy",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "express": "^4.18.0",
-    "http-proxy-middleware": "^2.0.0"
-  }
-}
-EOF
-
-    cat > /opt/api-gateway/services/openai-proxy/index.js << 'EOF'
-const express = require('express');
-const { createProxyMiddleware } = require('http-proxy-middleware');
-
-const app = express();
-app.use(express.json());
-
-// Логирование
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
-  next();
-});
-
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'openai-proxy' });
-});
-
-// Прокси для OpenAI
-app.use('/', createProxyMiddleware({
-  target: 'https://api.openai.com',
-  changeOrigin: true,
-  onProxyReq: (proxyReq, req, res) => {
-    proxyReq.setHeader('Authorization', `Bearer ${process.env.OPENAI_API_KEY}`);
-  },
-  onError: (err, req, res) => {
-    console.error('Proxy error:', err);
-    res.status(500).json({ error: 'Gateway error' });
-  }
-}));
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`OpenAI proxy running on port ${PORT}`);
-});
 EOF
 }
 
@@ -416,7 +329,7 @@ show_installation_info() {
     echo
     echo "🔐 Данные аутентификации:"
     echo "Логин: $USERNAME"
-    echo "Пароль: [скрыт]"
+    echo "Пароль: [указанный при установке]"
     echo "API Key для n8n: $N8N_API_KEY"
     echo
     echo "⚙️ Команды управления:"
@@ -428,7 +341,7 @@ show_installation_info() {
     echo "📝 Пример для n8n HTTP Request:"
     echo "URL: https://$DOMAIN/openai/v1/chat/completions"
     echo "Headers:"
-    echo "  Authorization: Basic $(echo -n "$USERNAME:$PASSWORD" | base64)"
+    echo "  Authorization: Basic $(echo -n "$USERNAME:$PASSWORD" | base64 -w 0)"
     echo "  Content-Type: application/json"
     echo
     warn "Не забудьте настроить DNS запись для домена $DOMAIN на IP этого сервера!"
